@@ -1,0 +1,8 @@
+*.bin
+*.elf
+*.pyc
+.DS_Store
+.idea/
+.vscode/
+build/
+
