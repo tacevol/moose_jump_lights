@@ -1,13 +1,13 @@
 # moose_jump_lights
 
-This project connects the Adafruit BNO085 IMU to an ESP32-S3 Reverse TFT Feather using UART for initial testing.
+This project connects the Adafruit BNO085 IMU to an ESP32 dev board using UART_RVC "robot vaccuum cleaner" protocol.
 
 ## Hardware
-- Adafruit BNO085 (STEMMA QT)
-- ESP32-S3 Reverse TFT Feather
+- Seeed Studio XIAO ESP32C3
+- Adafruit BNO085 (STEMMA QT). 
+  - PS0 tied high via solder jumper to set Mode to UART-RVC
 
 ## Features
 - IMU data streaming over Wi-Fi
-- Optional OTA updates
-- Real-time visualization on TFT display
-
+- Real-time data visualization via HTTP port
+- Optional OTA flashing
