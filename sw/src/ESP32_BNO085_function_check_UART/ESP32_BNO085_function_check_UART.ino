@@ -20,7 +20,7 @@
 #define BNO_TX_PIN -1   // unused in RVC
 
 // ---------- Feature toggles ----------
-#define ENABLE_LOGGING 0    // 0: disable all file writes for testing
+#define ENABLE_LOGGING 1    // 0: disable all file writes for testing
 #define DIAG_TIMING    0    // 1: print timing deltas on Serial (adds jitter)
 
 // ---------- Globals ----------
