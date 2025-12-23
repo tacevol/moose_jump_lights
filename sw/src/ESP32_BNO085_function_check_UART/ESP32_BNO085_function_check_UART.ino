@@ -413,10 +413,29 @@ void setup() {
   Serial.begin(115200);
   delay(100);
 
+  // debug why wifi reset
+  Serial.print("Reset reason: ");
+  Serial.println(esp_reset_reason());
+  // debug if memory issue  
+  Serial.print("Free heap: ");
+  Serial.println(ESP.getFreeHeap());
+
+
   if (!LittleFS.begin(true)) {
     Serial.println("LittleFS mount failed");
   }
   openLog(currentLogName);     // /imu_log.csv (default)
+
+  WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info){
+    if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+      Serial.print("WiFi DISCONNECTED, reason=");
+      Serial.println(info.wifi_sta_disconnected.reason);
+    }
+    if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
+      Serial.print("WiFi GOT IP: ");
+      Serial.println(WiFi.localIP());
+    }
+  });
 
   connectWiFi();
   setupOTA();
@@ -438,20 +457,34 @@ void setup() {
   Serial.println("WebSocket port: 81");
 
   pixels.begin();
-  pixels.setBrightness(160);   // good for LiPo
+  pixels.setBrightness(100);   // keep 0-255, keep <120 for LiPo to prevent voltage sag/brownout
   pixels.clear();
   pixels.show();
+
 }
 
 // ---------- Loop ----------
 void loop() {
+// temp IP check
+static uint32_t lastIpPrint=0;
+if (millis()-lastIpPrint > 5000) {
+  lastIpPrint = millis();
+  Serial.print("IP now: ");
+  Serial.println(WiFi.localIP());
+  Serial.print("WiFi status: ");
+  Serial.println((int)WiFi.status()); // 3 = WL_CONNECTED
+}
+
+
+// end IP check
+
 
 // temp LED check
-static uint32_t last = 0;
+static uint32_t lastUpdate = 0;
 static uint8_t hue = 0;
 
-if (millis() - last > 20) {
-  last = millis();
+if (millis() - lastUpdate > 10) {
+  lastUpdate = millis();
   hue++;
 
   uint32_t c1 = pixels.ColorHSV(hue * 256, 255, 255);
