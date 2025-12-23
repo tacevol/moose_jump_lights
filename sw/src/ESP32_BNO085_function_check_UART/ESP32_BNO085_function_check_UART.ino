@@ -14,13 +14,23 @@
 #include <WebSocketsServer.h>
 #include <LittleFS.h>
 #include "secrets.h"
+#include <Adafruit_NeoPixel.h>
 
 // ---------- Pins ----------
 #define BNO_RX_PIN 20   // XIAO ESP32C3 RX header (wired to BNO085 SDA / sensor TX)
 #define BNO_TX_PIN -1   // unused in RVC
+#define LED_DATA_PIN 5 // XIAO D3 = GPIO5
+
+// ---------- LEDs ----------
+#define NUM_LEDS 2
+Adafruit_NeoPixel pixels(
+  NUM_LEDS,
+  LED_DATA_PIN,
+  NEO_GRB + NEO_KHZ800
+);
 
 // ---------- Feature toggles ----------
-#define ENABLE_LOGGING 1    // 0: disable all file writes for testing
+#define ENABLE_LOGGING 0    // 0: disable all file writes for testing
 #define DIAG_TIMING    0    // 1: print timing deltas on Serial (adds jitter)
 
 // ---------- Globals ----------
@@ -426,10 +436,33 @@ void setup() {
 
   Serial.println("Open http://<ESP-IP>/ in your phone browser");
   Serial.println("WebSocket port: 81");
+
+  pixels.begin();
+  pixels.setBrightness(160);   // good for LiPo
+  pixels.clear();
+  pixels.show();
 }
 
 // ---------- Loop ----------
 void loop() {
+
+// temp LED check
+static uint32_t last = 0;
+static uint8_t hue = 0;
+
+if (millis() - last > 20) {
+  last = millis();
+  hue++;
+
+  uint32_t c1 = pixels.ColorHSV(hue * 256, 255, 255);
+  uint32_t c2 = pixels.ColorHSV((hue + 85) * 256, 255, 255);
+
+  pixels.setPixelColor(0, c1);
+  pixels.setPixelColor(1, c2);
+  pixels.show();
+}
+// end LED check
+
 #if DIAG_TIMING
   uint32_t now = dev_now_us();
   Serial.printf("DeltaRead_us=%lu DeltaSend_us=%lu\n", now - lastReadMicros, now - lastSendMicros);
