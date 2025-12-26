@@ -30,7 +30,7 @@ Adafruit_NeoPixel pixels(
 );
 
 // ---------- Feature toggles ----------
-#define ENABLE_LOGGING 0    // 0: disable all file writes for testing
+#define ENABLE_LOGGING 1    // 0: disable all file writes for testing
 #define DIAG_TIMING    0    // 1: print timing deltas on Serial (adds jitter)
 
 // ---------- Globals ----------
@@ -125,8 +125,13 @@ const series = [
 ];
 
 const BUFFER = 1200;     // ~20s at 60Hz
-const data = {};
-series.forEach(s => data[s.key] = new Array(BUFFER).fill(null));
+const data = {
+  t: new Array(BUFFER).fill(null)
+};
+series.forEach(s => {
+  data[s.key] = new Array(BUFFER).fill(null);
+});
+
 let head = 0;
 let paused = false;
 
@@ -201,50 +206,75 @@ async function syncClock(samples=8, timeout=500){
 }
 
 // WebSocket
-function openWS(){
+function openWS() {
   ws = new WebSocket('ws://' + location.hostname + ':81');
-  ws.onopen = async ()=>{
+
+  ws.onopen = async () => {
     netEl.textContent = 'Syncing clock…';
     await syncClock(8);
   };
 
-  let lastSeq = null;
-  let lastT = null; // device ms at read
-  let lastHost = null; // host ms at arrival
+  let lastSeq  = null;
+  let lastDevT = null; // last device timestamp (ms)
+  let lastHost = null; // last browser timestamp (ms, performance.now)
 
-  ws.onmessage = (ev)=>{
-    let d; try{ d=JSON.parse(ev.data); }catch{ return; }
-    if (d.type==='ack' || d.type==='sync') return;
+  ws.onmessage = (ev) => {
+    let d;
+    try {
+      d = JSON.parse(ev.data);
+    } catch {
+      return;
+    }
+
+    if (d.type === 'ack' || d.type === 'sync') return;
     if (paused) return;
 
     const hostNow = performance.now();
 
     if (lastSeq !== null) {
-      const dSeq = d.seq - lastSeq;
-      const dDev = d.t   - lastT;      // ms between IMU reads (on ESP32)
-      const dHost = hostNow - lastHost; // ms between arrivals in browser
+      const dSeq  = d.seq - lastSeq;
+      const dDev  = d.t   - lastDevT;    // ms between *device* timestamps
+      const dHost = hostNow - lastHost;  // ms between arrivals in browser
 
-      // Tune these thresholds as needed
-      if (dDev  > 30)   console.log('BIG DEVICE GAP', dSeq, 'samples,', dDev, 'ms');
-      if (dHost > 30)   console.log('BIG HOST GAP',   dSeq, 'samples,', dHost, 'ms');
+      // Device timing is already handled on the ESP side.
+      // Host jitter < ~150 ms is usually just Wi-Fi / browser noise.
+      if (dHost > 80) {
+        console.log(
+          'BIG HOST GAP',
+          dSeq, 'samples,',
+          dHost.toFixed(1), 'ms',
+          ev.target.url
+        );
+      }
+
+      // (Optional: if you want to inspect device-side spacing too)
+      // if (dDev > 50) {
+      //   console.log('WEIRD DEVICE DELTA FROM ESP', dSeq, 'samples,', dDev, 'ms');
+      // }
     }
 
     lastSeq  = d.seq;
-    lastT    = d.t;
+    lastDevT = d.t;
     lastHost = hostNow;
 
-    // push into ring buffers
+    // push into ring buffers (now includes device time)
+    // make sure data.t is allocated like the others: new Float32Array(BUFFER) or similar
+    data.t[head]     = d.t;    // device time in ms
     data.yaw[head]   = d.yaw;
     data.pitch[head] = d.pitch;
     data.roll[head]  = d.roll;
     data.ax[head]    = d.ax;
     data.ay[head]    = d.ay;
     data.az[head]    = d.az;
+
     head = (head + 1) % BUFFER;
   };
-  ws.onclose = ()=> setTimeout(openWS, 800);
+
+  ws.onclose = () => setTimeout(openWS, 800);
 }
+
 openWS();
+
 
 // Plotting
 function getRange(kind){
@@ -530,32 +560,32 @@ void loop() {
   // Read IMU → stream & log
   static uint32_t lastFlush = 0;
   static uint32_t lastSend  = 0;
-  static uint32_t lastImuMs = 0;   // <--- NEW: track time between IMU samples
+  static uint32_t lastImuMs = 0;   // track time between IMU samples
 
   BNO08x_RVC_Data d;
   if (rvc.read(&d)) {
     const uint32_t tr_us = dev_now_us();  // device time at read (us)
     const uint32_t t_ms  = dev_now_ms();  // device time at read (ms)
 
-    // --- NEW: check time between IMU samples ---
+    // IMU gap check
     if (lastImuMs != 0) {                 // skip first sample
       uint32_t dt = t_ms - lastImuMs;
-      if (dt > 25) {                      // threshold; tweak as needed
+      if (dt > 25) {                      // only log "real" stalls. typical IMU gap during good performance is ~10 ms
         Serial.printf("IMU GAP %lu ms\n", (unsigned long)dt);
       }
     }
     lastImuMs = t_ms;
-    // --- end IMU gap check ---
+    // end IMU gap check
 
-    // --- throttle WS to ~60 Hz (smoother, less jitter) ---
-    if (t_ms - lastSend >= 16) {  // 16 ms ≈ 60 fps
+    // --- throttle WS to ~30 Hz (less blocking) ---
+    if (t_ms - lastSend >= 33) {  // 16 ms ≈ 60 fps, 33 ms ≈ 30 fps 
       lastSend = t_ms;
 
       // Timestamp right before send
       const uint32_t ts_us  = dev_now_us();
       const uint32_t thisSeq = ++seqNo;
 
-      // compact JSON for WS UI (with timing; UI doesn’t use here, but harmless)
+      // compact JSON for WS UI (with timing)
       char js[196];
       snprintf(js, sizeof(js),
         "{\"type\":\"data\",\"seq\":%lu,\"t\":%lu,\"tr_us\":%lu,\"ts_us\":%lu,"
