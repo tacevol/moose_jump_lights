@@ -578,7 +578,7 @@ void loop() {
     // end IMU gap check
 
     // --- throttle WS to ~30 Hz (less blocking) ---
-    if (t_ms - lastSend >= 33) {  // 16 ms ≈ 60 fps, 33 ms ≈ 30 fps 
+    if (t_ms - lastSend >= 67) {  // 16 ms ≈ 60 fps, 33 ms ≈ 30 fps,  67 ms ≈ 15 fps
       lastSend = t_ms;
 
       // Timestamp right before send
