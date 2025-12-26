@@ -207,10 +207,31 @@ function openWS(){
     netEl.textContent = 'Syncing clock…';
     await syncClock(8);
   };
+
+  let lastSeq = null;
+  let lastT = null; // device ms at read
+  let lastHost = null; // host ms at arrival
+
   ws.onmessage = (ev)=>{
     let d; try{ d=JSON.parse(ev.data); }catch{ return; }
     if (d.type==='ack' || d.type==='sync') return;
     if (paused) return;
+
+    const hostNow = performance.now();
+
+    if (lastSeq !== null) {
+      const dSeq = d.seq - lastSeq;
+      const dDev = d.t   - lastT;      // ms between IMU reads (on ESP32)
+      const dHost = hostNow - lastHost; // ms between arrivals in browser
+
+      // Tune these thresholds as needed
+      if (dDev  > 30)   console.log('BIG DEVICE GAP', dSeq, 'samples,', dDev, 'ms');
+      if (dHost > 30)   console.log('BIG HOST GAP',   dSeq, 'samples,', dHost, 'ms');
+    }
+
+    lastSeq  = d.seq;
+    lastT    = d.t;
+    lastHost = hostNow;
 
     // push into ring buffers
     data.yaw[head]   = d.yaw;
@@ -459,46 +480,46 @@ void setup() {
   pixels.begin();
   pixels.setBrightness(100);   // keep 0-255, keep <120 for LiPo to prevent voltage sag/brownout
   pixels.clear();
-  pixels.show();
+  // pixels.show();
 
 }
 
 // ---------- Loop ----------
 void loop() {
-// temp IP check
-static uint32_t lastIpPrint=0;
-if (millis()-lastIpPrint > 5000) {
-  lastIpPrint = millis();
-  Serial.print("IP now: ");
-  Serial.println(WiFi.localIP());
-  Serial.print("WiFi status: ");
-  Serial.println((int)WiFi.status()); // 3 = WL_CONNECTED
-}
+  // temp IP check
+  static uint32_t lastIpPrint = 0;
 
+  if (millis() - lastIpPrint > 5000) {
+    lastIpPrint = millis();
+    Serial.print("IP now: ");
+    Serial.println(WiFi.localIP());
+    Serial.print("WiFi status: ");
+    Serial.println((int)WiFi.status()); // 3 = WL_CONNECTED
+  }
+  // end IP check
 
-// end IP check
+  // temp LED check
+  static uint32_t lastUpdate = 0;
+  static uint8_t  hue        = 0;
 
+  if (millis() - lastUpdate > 10) {
+    lastUpdate = millis();
+    hue++;
 
-// temp LED check
-static uint32_t lastUpdate = 0;
-static uint8_t hue = 0;
+    uint32_t c1 = pixels.ColorHSV(hue * 256,       255, 255);
+    uint32_t c2 = pixels.ColorHSV((hue + 85) * 256, 255, 255);
 
-if (millis() - lastUpdate > 10) {
-  lastUpdate = millis();
-  hue++;
-
-  uint32_t c1 = pixels.ColorHSV(hue * 256, 255, 255);
-  uint32_t c2 = pixels.ColorHSV((hue + 85) * 256, 255, 255);
-
-  pixels.setPixelColor(0, c1);
-  pixels.setPixelColor(1, c2);
-  pixels.show();
-}
-// end LED check
+    pixels.setPixelColor(0, c1);
+    pixels.setPixelColor(1, c2);
+    pixels.clear(); // delete me?
+    // pixels.show();
+  }
+  // end LED check
 
 #if DIAG_TIMING
   uint32_t now = dev_now_us();
-  Serial.printf("DeltaRead_us=%lu DeltaSend_us=%lu\n", now - lastReadMicros, now - lastSendMicros);
+  Serial.printf("DeltaRead_us=%lu DeltaSend_us=%lu\n",
+                now - lastReadMicros, now - lastSendMicros);
   lastReadMicros = now;
 #endif
 
@@ -509,34 +530,50 @@ if (millis() - lastUpdate > 10) {
   // Read IMU → stream & log
   static uint32_t lastFlush = 0;
   static uint32_t lastSend  = 0;
+  static uint32_t lastImuMs = 0;   // <--- NEW: track time between IMU samples
 
   BNO08x_RVC_Data d;
   if (rvc.read(&d)) {
     const uint32_t tr_us = dev_now_us();  // device time at read (us)
     const uint32_t t_ms  = dev_now_ms();  // device time at read (ms)
 
+    // --- NEW: check time between IMU samples ---
+    if (lastImuMs != 0) {                 // skip first sample
+      uint32_t dt = t_ms - lastImuMs;
+      if (dt > 25) {                      // threshold; tweak as needed
+        Serial.printf("IMU GAP %lu ms\n", (unsigned long)dt);
+      }
+    }
+    lastImuMs = t_ms;
+    // --- end IMU gap check ---
+
     // --- throttle WS to ~60 Hz (smoother, less jitter) ---
     if (t_ms - lastSend >= 16) {  // 16 ms ≈ 60 fps
       lastSend = t_ms;
 
       // Timestamp right before send
-      const uint32_t ts_us = dev_now_us();
+      const uint32_t ts_us  = dev_now_us();
       const uint32_t thisSeq = ++seqNo;
 
       // compact JSON for WS UI (with timing; UI doesn’t use here, but harmless)
       char js[196];
       snprintf(js, sizeof(js),
         "{\"type\":\"data\",\"seq\":%lu,\"t\":%lu,\"tr_us\":%lu,\"ts_us\":%lu,"
-        "\"yaw\":%.2f,\"pitch\":%.2f,\"roll\":%.2f,\"ax\":%.3f,\"ay\":%.3f,\"az\":%.3f}",
+        "\"yaw\":%.2f,\"pitch\":%.2f,\"roll\":%.2f,"
+        "\"ax\":%.3f,\"ay\":%.3f,\"az\":%.3f}",
         (unsigned long)thisSeq, (unsigned long)t_ms,
         (unsigned long)tr_us, (unsigned long)ts_us,
-        d.yaw, d.pitch, d.roll, d.x_accel, d.y_accel, d.z_accel);
-      ws.broadcastTXT(js);
+        d.yaw, d.pitch, d.roll,
+        d.x_accel, d.y_accel, d.z_accel);
+
+      ws.broadcastTXT(js); // TODO FIXME temp disabled to assess data display hiccup
 
 #if ENABLE_LOGGING
       if (logFile) {
         logFile.printf("%lu,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,,\n",
-          (unsigned long)t_ms, d.yaw, d.pitch, d.roll, d.x_accel, d.y_accel, d.z_accel);
+          (unsigned long)t_ms,
+          d.yaw, d.pitch, d.roll,
+          d.x_accel, d.y_accel, d.z_accel);
 
         // flush once per second instead of every line
         if (t_ms - lastFlush >= 1000) {
@@ -548,3 +585,4 @@ if (millis() - lastUpdate > 10) {
     }
   }
 }
+
