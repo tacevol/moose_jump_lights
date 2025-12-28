@@ -20,6 +20,19 @@
 #include "secrets.h"
 #include <Adafruit_NeoPixel.h>
 
+// WiFi priority list: earlier entries are higher priority
+struct WiFiCred {
+  const char* ssid;
+  const char* pass;
+};
+
+const WiFiCred WIFI_PRIORITY[] = {
+  { WIFI_SSID_HOTSPOT, WIFI_PASS_HOTSPOT },  // #1: field hotspot
+  { WIFI_SSID_HOME,    WIFI_PASS_HOME    },  // #2: home WiFi
+};
+
+const int WIFI_PRIORITY_COUNT = sizeof(WIFI_PRIORITY) / sizeof(WIFI_PRIORITY[0]);
+
 // ---------- Pins ----------
 #define BNO_RX_PIN    20   // XIAO ESP32C3 RX header (wired to BNO085 SDA / sensor TX)
 #define BNO_TX_PIN    -1   // unused in RVC
@@ -36,7 +49,7 @@ Adafruit_NeoPixel pixels(
 // ---------- Feature toggles ----------
 #define ENABLE_LOGGING    1    // 0: disable file writes, 1: enable event-window logging
 #define DIAG_TIMING       0    // 1: print timing deltas on Serial (adds jitter)
-#define FORCE_FORMAT_FS   1    // 1: format LittleFS on boot (use once to clear old logs, then set back to 0)
+#define FORCE_FORMAT_FS   0    // 1: format LittleFS on boot (use once to clear old logs, then set back to 0)
 
 // ---------- Globals ----------
 Adafruit_BNO08x_RVC rvc;
@@ -381,10 +394,51 @@ requestAnimationFrame(render);
 // ---------- Wi-Fi / OTA ----------
 static void connectWiFi() {
   WiFi.mode(WIFI_STA);
-  WiFi.begin(SECRET_WIFI_SSID, SECRET_WIFI_PASS);
-  Serial.print("WiFi connecting");
-  while (WiFi.status() != WL_CONNECTED) { delay(200); Serial.print("."); }
-  Serial.print("\nWiFi: "); Serial.println(WiFi.localIP());
+  WiFi.setAutoReconnect(false);  // we'll manage it ourselves here
+  WiFi.persistent(false);        // don't write creds to flash
+
+  const uint32_t CONNECT_TIMEOUT_MS = 8000;  // per-network timeout
+
+  for (int idx = 0; idx < WIFI_PRIORITY_COUNT; ++idx) {
+    const char* ssid = WIFI_PRIORITY[idx].ssid;
+    const char* pass = WIFI_PRIORITY[idx].pass;
+
+    if (!ssid || ssid[0] == '\0') {
+      continue;  // skip empty slots
+    }
+
+    // Make sure any previous attempt is fully stopped
+    WiFi.disconnect(true, true);   // drop connection and clear old config
+    delay(200);
+
+    Serial.printf("Trying WiFi SSID '%s'...\n", ssid);
+    WiFi.begin(ssid, pass);
+
+    uint32_t start = millis();
+    wl_status_t st;
+
+    while ((st = WiFi.status()) != WL_CONNECTED &&
+           (millis() - start) < CONNECT_TIMEOUT_MS) {
+      delay(200);
+      Serial.print(".");
+    }
+    Serial.println();
+
+    st = WiFi.status();
+    if (st == WL_CONNECTED) {
+      IPAddress ip = WiFi.localIP();
+      Serial.print("WiFi connected to ");
+      Serial.print(ssid);
+      Serial.print(" | IP: ");
+      Serial.println(ip);
+      return;
+    }
+
+    Serial.printf("Failed to connect to '%s' (status=%d)\n", ssid, (int)st);
+    // Loop will go on to next SSID and repeat the disconnect/begin cycle
+  }
+
+  Serial.println("WiFi: failed to connect to any configured network.");
 }
 
 static void setupOTA() {
