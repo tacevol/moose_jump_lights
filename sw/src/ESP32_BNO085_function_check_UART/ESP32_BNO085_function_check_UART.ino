@@ -1,10 +1,14 @@
 /**************************************************************************
   Seeed studio XIAO ESP32C3
-  BNO085 UART-RVC + OTA + WebSocket + CSV logging + Live Plot
+  BNO085 UART-RVC + OTA + WebSocket + Event-Window Logging + Live Plot
 
   - HTTP (port 80): serves the web UI with a canvas plot and checkboxes
-  - WebSocket (port 81): real-time JSON stream + control events
-  - CSV available at http://<esp-ip>/download
+  - WebSocket (port 81): real-time JSON stream + control/events
+  - On "catch/miss/other" event:
+      * Take a snapshot of the last PRE_WINDOW_MS of IMU data from RAM
+      * Write that window to a new CSV
+      * Append an event row
+      * Close file and reset segment metrics
  **************************************************************************/
 
 #include <WiFi.h>
@@ -17,9 +21,9 @@
 #include <Adafruit_NeoPixel.h>
 
 // ---------- Pins ----------
-#define BNO_RX_PIN 20   // XIAO ESP32C3 RX header (wired to BNO085 SDA / sensor TX)
-#define BNO_TX_PIN -1   // unused in RVC
-#define LED_DATA_PIN 5 // XIAO D3 = GPIO5
+#define BNO_RX_PIN    20   // XIAO ESP32C3 RX header (wired to BNO085 SDA / sensor TX)
+#define BNO_TX_PIN    -1   // unused in RVC
+#define LED_DATA_PIN   5   // XIAO D3 = GPIO5
 
 // ---------- LEDs ----------
 #define NUM_LEDS 2
@@ -30,8 +34,9 @@ Adafruit_NeoPixel pixels(
 );
 
 // ---------- Feature toggles ----------
-#define ENABLE_LOGGING 1    // 0: disable all file writes for testing
-#define DIAG_TIMING    0    // 1: print timing deltas on Serial (adds jitter)
+#define ENABLE_LOGGING    1    // 0: disable file writes, 1: enable event-window logging
+#define DIAG_TIMING       0    // 1: print timing deltas on Serial (adds jitter)
+#define FORCE_FORMAT_FS   1    // 1: format LittleFS on boot (use once to clear old logs, then set back to 0)
 
 // ---------- Globals ----------
 Adafruit_BNO08x_RVC rvc;
@@ -39,16 +44,49 @@ Adafruit_BNO08x_RVC rvc;
 WebServer         http(80);
 WebSocketsServer  ws(81);                 // ws://<ip>:81
 File              logFile;
-char              currentLogName[48] = "/imu_log.csv";
+char              currentLogName[48] = "";
 
-// const uint8_t LED_BRIGHT = 16;
-uint32_t lastReadMicros = 0;
-uint32_t lastSendMicros = 0;
-volatile uint32_t seqNo = 0;              // sequence counter for each streamed sample
+// Sequence counter for each streamed sample
+volatile uint32_t seqNo = 0;
 
 // time helpers
 static inline uint32_t dev_now_ms() { return millis(); }
 static inline uint32_t dev_now_us() { return micros(); }
+
+// ---------- Ring buffer for pre-event logging (RAM only) ----------
+// We want a ~30s pre-event window.
+// At ~100 Hz, that is ~3000 samples. These are related but not identical:
+// PRE_WINDOW_MS is a time window; RING_CAP is the max number of samples we store.
+const uint32_t PRE_WINDOW_MS = 30000;  // 30 seconds of history
+const size_t   RING_CAP      = 3000;   // max samples in ring
+uint32_t sessionStartMs = 0; // timestamp when we hit New Session button
+
+struct ImuSample {
+  uint32_t t_ms;
+  float yaw, pitch, roll;
+  float ax, ay, az;
+};
+
+ImuSample ringBuf[RING_CAP];
+size_t    ringHead      = 0;   // next write index
+bool      ringFilled    = false;
+
+// Segment / health metrics (reset per segment/event)
+uint32_t segSamples      = 0;
+uint32_t segStartMs      = 0;
+uint32_t imuGapCount     = 0;
+uint32_t imuGapMaxMs     = 0;
+float    imuAvgPeriodMs  = 0.0f;
+uint32_t lastImuMs       = 0;
+
+void resetSegmentMetrics() {
+  segSamples     = 0;
+  segStartMs     = 0;
+  imuGapCount    = 0;
+  imuGapMaxMs    = 0;
+  imuAvgPeriodMs = 0.0f;
+  lastImuMs      = 0;
+}
 
 // ---------- HTML UI (served from flash) ----------
 const char PAGE_INDEX[] PROGMEM = R"HTML(
@@ -99,8 +137,7 @@ const char PAGE_INDEX[] PROGMEM = R"HTML(
 </div>
 
 <div class="row muted" style="font-size:13px">
-  <div>Angles: deg (±180 default)</div>
-  <div>Accel: m/s^2 (±40 default)</div>
+  <div>Accel Z: m/s^2 (±40 default)</div>
 </div>
 
 <script>
@@ -114,29 +151,20 @@ ipEl.textContent = location.host;
 
 let ws;
 
-// Series config
+// Series config: ONLY az for now
 const series = [
-  { key:'yaw',   color:'#d81b60', enabled:false, kind:'ang' },
-  { key:'pitch', color:'#8e24aa', enabled:false, kind:'ang' },
-  { key:'roll',  color:'#3949ab', enabled:true,  kind:'ang' },
-  { key:'ax',    color:'#1e88e5', enabled:true,  kind:'acc' },
-  { key:'ay',    color:'#43a047', enabled:true,  kind:'acc' },
   { key:'az',    color:'#f4511e', enabled:true,  kind:'acc' },
 ];
 
-const BUFFER = 1200;     // ~20s at 60Hz
-const data = {
-  t: new Array(BUFFER).fill(null)
-};
-series.forEach(s => {
-  data[s.key] = new Array(BUFFER).fill(null);
-});
-
+const BUFFER = 1200;     // ring buffer for plotting (host-side only)
+const data = {};
+series.forEach(s => data[s.key] = new Array(BUFFER).fill(null));
+data.t = new Array(BUFFER).fill(null);
 let head = 0;
 let paused = false;
 
 // Ranges
-const FIXED = { ang:[-180,180], acc:[-40,40] };
+const FIXED = { acc:[-40,40] };
 const autoscaleEl = document.getElementById('autoscale');
 
 // UI legend + checkboxes
@@ -231,14 +259,13 @@ function openWS() {
 
     const hostNow = performance.now();
 
-    if (lastSeq !== null) {
+    if (lastSeq !== null && d.seq !== undefined && d.t !== undefined) {
       const dSeq  = d.seq - lastSeq;
-      const dDev  = d.t   - lastDevT;    // ms between *device* timestamps
+      const dDev  = d.t   - lastDevT;    // ms between device timestamps
       const dHost = hostNow - lastHost;  // ms between arrivals in browser
 
-      // Device timing is already handled on the ESP side.
-      // Host jitter < ~150 ms is usually just Wi-Fi / browser noise.
-      if (dHost > 80) {
+      // Host jitter check (for debugging streaming health)
+      if (dHost > 150) {  // raise threshold; only log truly big stalls
         console.log(
           'BIG HOST GAP',
           dSeq, 'samples,',
@@ -246,27 +273,16 @@ function openWS() {
           ev.target.url
         );
       }
-
-      // (Optional: if you want to inspect device-side spacing too)
-      // if (dDev > 50) {
-      //   console.log('WEIRD DEVICE DELTA FROM ESP', dSeq, 'samples,', dDev, 'ms');
-      // }
+      // Device-side spacing is monitored on the ESP already
     }
 
     lastSeq  = d.seq;
     lastDevT = d.t;
     lastHost = hostNow;
 
-    // push into ring buffers (now includes device time)
-    // make sure data.t is allocated like the others: new Float32Array(BUFFER) or similar
-    data.t[head]     = d.t;    // device time in ms
-    data.yaw[head]   = d.yaw;
-    data.pitch[head] = d.pitch;
-    data.roll[head]  = d.roll;
-    data.ax[head]    = d.ax;
-    data.ay[head]    = d.ay;
-    data.az[head]    = d.az;
-
+    // push into ring buffer for plotting (az only)
+    data.t[head]  = d.t;
+    data.az[head] = ('az' in d) ? d.az : null;
     head = (head + 1) % BUFFER;
   };
 
@@ -274,7 +290,6 @@ function openWS() {
 }
 
 openWS();
-
 
 // Plotting
 function getRange(kind){
@@ -346,24 +361,15 @@ function drawSeries(arr, color, x, y, w, h, ylo, yhi){
 function render(){
   ctx.clearRect(0,0,cvs.width,cvs.height);
 
-  // Split canvas into two rows: angles (top), accel (bottom)
   const pad = 12;
   const w = cvs.width - pad*2;
-  const h = cvs.height - pad*3;
-  const rowH = (h/2) - pad;
+  const h = cvs.height - pad*2;
 
-  // ANGLES
-  const [angLo,angHi] = getRange('ang');
-  drawGrid(pad, pad, w, rowH, angLo, angHi, 'angles (deg)');
-  series.filter(s=>s.kind==='ang' && s.enabled).forEach(s=>{
-    drawSeries(data[s.key], s.color, pad, pad, w, rowH, angLo, angHi);
-  });
-
-  // ACCEL
+  // Single panel: accel Z
   const [accLo,accHi] = getRange('acc');
-  drawGrid(pad, pad*2+rowH, w, rowH, accLo, accHi, 'accel (m/s^2)');
+  drawGrid(pad, pad, w, h, accLo, accHi, 'az (m/s^2)');
   series.filter(s=>s.kind==='acc' && s.enabled).forEach(s=>{
-    drawSeries(data[s.key], s.color, pad, pad*2+rowH, w, rowH, accLo, accHi);
+    drawSeries(data[s.key], s.color, pad, pad, w, h, accLo, accHi);
   });
 
   requestAnimationFrame(render);
@@ -380,6 +386,7 @@ static void connectWiFi() {
   while (WiFi.status() != WL_CONNECTED) { delay(200); Serial.print("."); }
   Serial.print("\nWiFi: "); Serial.println(WiFi.localIP());
 }
+
 static void setupOTA() {
   ArduinoOTA.setHostname(SECRET_OTA_HOSTNAME);
   if (SECRET_OTA_PASS_HASH && strlen(SECRET_OTA_PASS_HASH)==64) {
@@ -389,21 +396,27 @@ static void setupOTA() {
   Serial.println("OTA ready");
 }
 
-// ---------- Logging ----------
+// ---------- Logging helpers ----------
 void openLog(const char* name) {
-  if (logFile) logFile.close();
+  if (logFile) {
+    logFile.close();
+  }
+
   strncpy(currentLogName, name, sizeof(currentLogName));
+  currentLogName[sizeof(currentLogName) - 1] = '\0';
+
   logFile = LittleFS.open(currentLogName, FILE_WRITE);
   if (logFile && logFile.size()==0) {
     logFile.println("t_ms,yaw,pitch,roll,ax,ay,az,event,note");
   }
 }
+
 void rotateLog() {
   static uint16_t idx = 1;
   char buf[48];
   snprintf(buf, sizeof(buf), "/imu_log_%u.csv", idx++);
   openLog(buf);
-  Serial.printf("New session: %s\n", buf);
+  Serial.printf("New segment: %s\n", buf);
 }
 
 // ---------- HTTP ----------
@@ -413,8 +426,12 @@ void handleRoot() {
   http.send(200, "text/html", "");
   http.sendContent_P(PAGE_INDEX);
 }
+
 void handleDownload() {
-  if (!LittleFS.exists(currentLogName)) { http.send(404, "text/plain", "log not found"); return; }
+  if (!currentLogName[0] || !LittleFS.exists(currentLogName)) {
+    http.send(404, "text/plain", "log not found");
+    return;
+  }
   File f = LittleFS.open(currentLogName, FILE_READ);
   http.streamFile(f, "text/csv");
   f.close();
@@ -442,21 +459,100 @@ void wsEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t len) {
       return;
     }
 
-    // rotate command
+    // "New Session" from UI: clear history + reset metrics + (optionally) delete current log
     if (msg.indexOf("\"type\":\"rotate\"") >= 0) {
-      rotateLog();
-      ws.sendTXT(num, "{\"type\":\"ack\",\"cmd\":\"rotate\"}");
-      return;
+      sessionStartMs = dev_now_ms();  // mark start of new session
+
+      // Clear RAM ring buffer
+      ringHead   = 0;
+      ringFilled = false;
+
+      // Reset per-segment metrics
+      resetSegmentMetrics();
+
+      #if ENABLE_LOGGING
+        // Optional: delete the last CSV to keep FS clean once you've downloaded it
+        if (currentLogName[0] && LittleFS.exists(currentLogName)) {
+          LittleFS.remove(currentLogName);
+        }
+        currentLogName[0] = '\0';
+      #endif
+
+        ws.sendTXT(num, "{\"type\":\"ack\",\"cmd\":\"rotate\"}");
+        return;
     }
 
-    // event with optional note (append to CSV)
+    // event with optional note (flush pre-window from ring buffer to CSV)
     String kind = "", note = "";
-    int k2 = msg.indexOf("\"kind\":\""); if (k2>=0){ int s=k2+8; int e=msg.indexOf("\"",s); kind=msg.substring(s,e); }
-    int n = msg.indexOf("\"note\":\""); if (n>=0){ int s=n+8; int e=msg.indexOf("\"",s); note=msg.substring(s,e); note.replace(",", " "); }
-    uint32_t t = millis();
-    if (logFile) logFile.printf("%lu,,,,,,,%s,%s\n", (unsigned long)t, kind.c_str(), note.c_str());
-    ws.sendTXT(num, "{\"type\":\"ack\",\"cmd\":\"event\"}");
-  }
+    int k2 = msg.indexOf("\"kind\":\"");
+    if (k2 >= 0) {
+      int s = k2 + 8;
+      int e = msg.indexOf("\"", s);
+      if (e > s) kind = msg.substring(s, e);
+    }
+    int n = msg.indexOf("\"note\":\"");
+    if (n >= 0) {
+      int s = n + 8;
+      int e = msg.indexOf("\"", s);
+      if (e > s) {
+        note = msg.substring(s, e);
+        note.replace(",", " ");  // keep CSV clean
+      }
+    }
+
+  uint32_t t_event = dev_now_ms();
+
+
+  #if ENABLE_LOGGING
+      // Create a new segment file for this event
+      rotateLog();  // sets currentLogName and opens logFile
+
+      if (logFile) {
+        // Base: 30s window
+        const uint32_t baseStart =
+          (t_event > PRE_WINDOW_MS) ? (t_event - PRE_WINDOW_MS) : 0;
+
+        // Don't include samples from before the current sesion
+        const uint32_t windowStart = 
+          (sessionStartMs > baseStart) ? sessionStartMs : baseStart;
+
+        size_t count = ringFilled ? RING_CAP : ringHead;
+        size_t idx = ringFilled ? ringHead : 0; // oldest
+
+        for (size_t i = 0; i < count; ++i) {
+          const ImuSample &s = ringBuf[idx];
+
+          // Only keep samples in [windowStart, t_event]
+          if (s.t_ms >= windowStart && s.t_ms <= t_event) {
+            logFile.printf(
+              "%lu,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,,\n",
+              (unsigned long)s.t_ms,
+              s.yaw, s.pitch, s.roll,
+              s.ax, s.ay, s.az
+            );
+          }
+
+          idx = (idx + 1) % RING_CAP;
+        }
+
+        // Append the event row itself
+        logFile.printf(
+          "%lu,,,,,,,%s,%s\n",
+          (unsigned long)t_event,
+          kind.c_str(),
+          note.c_str()
+        );
+
+        logFile.flush();
+        logFile.close();
+      }
+  #endif
+
+      // Reset metrics for the next segment
+      resetSegmentMetrics();
+
+      ws.sendTXT(num, "{\"type\":\"ack\",\"cmd\":\"event\"}");
+    }
 }
 
 // ---------- Setup ----------
@@ -464,18 +560,55 @@ void setup() {
   Serial.begin(115200);
   delay(100);
 
-  // debug why wifi reset
   Serial.print("Reset reason: ");
   Serial.println(esp_reset_reason());
-  // debug if memory issue  
   Serial.print("Free heap: ");
   Serial.println(ESP.getFreeHeap());
 
+  // ---------- LittleFS init / optional format ---------- 
+    if (!LittleFS.begin()) {
+      Serial.println("LittleFS mount failed, trying to format...");
+      if (LittleFS.format()) {
+        Serial.println("LittleFS format OK, remounting...");
+        if (!LittleFS.begin()) {
+          Serial.println("LittleFS remount failed after format!");
+        }
+      } else {
+        Serial.println("LittleFS format FAILED!");
+      }
+    } else {
+      Serial.println("LittleFS mounted OK.");
+    }
 
-  if (!LittleFS.begin(true)) {
-    Serial.println("LittleFS mount failed");
-  }
-  openLog(currentLogName);     // /imu_log.csv (default)
+    #if FORCE_FORMAT_FS
+      Serial.println("FORCE_FORMAT_FS=1 → formatting LittleFS...");
+      if (LittleFS.format()) {
+        Serial.println("Forced format OK, remounting LittleFS...");
+        if (!LittleFS.begin()) {
+          Serial.println("LittleFS remount failed after forced format!");
+        }
+      } else {
+        Serial.println("Forced LittleFS format FAILED!");
+      }
+    #endif
+
+    // Print FS stats so we know how big the partition actually is
+    if (LittleFS.begin()) {
+      size_t total = LittleFS.totalBytes();
+      size_t used  = LittleFS.usedBytes();
+      size_t freeB = (total > used) ? (total - used) : 0;
+      Serial.printf("LittleFS: total=%u bytes, used=%u, free=%u\n",
+                    (unsigned)total, (unsigned)used, (unsigned)freeB);
+    } else {
+      Serial.println("LittleFS still not mounted, logging disabled.");
+    }
+
+  currentLogName[0] = '\0';
+  resetSegmentMetrics();
+
+  // Start initial session at boot
+  sessionStartMs = dev_now_ms();
+
 
   WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info){
     if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
@@ -511,7 +644,6 @@ void setup() {
   pixels.setBrightness(100);   // keep 0-255, keep <120 for LiPo to prevent voltage sag/brownout
   pixels.clear();
   // pixels.show();
-
 }
 
 // ---------- Loop ----------
@@ -521,9 +653,9 @@ void loop() {
 
   if (millis() - lastIpPrint > 5000) {
     lastIpPrint = millis();
-    Serial.print("IP now: ");
-    Serial.println(WiFi.localIP());
-    Serial.print("WiFi status: ");
+    Serial.print("IP: ");
+    Serial.print(WiFi.localIP());
+    Serial.print(" | Status: ");
     Serial.println((int)WiFi.status()); // 3 = WL_CONNECTED
   }
   // end IP check
@@ -536,7 +668,7 @@ void loop() {
     lastUpdate = millis();
     hue++;
 
-    uint32_t c1 = pixels.ColorHSV(hue * 256,       255, 255);
+    uint32_t c1 = pixels.ColorHSV(hue * 256,        255, 255);
     uint32_t c2 = pixels.ColorHSV((hue + 85) * 256, 255, 255);
 
     pixels.setPixelColor(0, c1);
@@ -547,72 +679,79 @@ void loop() {
   // end LED check
 
 #if DIAG_TIMING
-  uint32_t now = dev_now_us();
+  static uint32_t lastReadMicros = 0;
+  static uint32_t lastSendMicros = 0;
+  uint32_t now_us = dev_now_us();
   Serial.printf("DeltaRead_us=%lu DeltaSend_us=%lu\n",
-                now - lastReadMicros, now - lastSendMicros);
-  lastReadMicros = now;
+                now_us - lastReadMicros, now_us - lastSendMicros);
+  lastReadMicros = now_us;
 #endif
 
   ArduinoOTA.handle();
   http.handleClient();
   ws.loop();
 
-  // Read IMU → stream & log
-  static uint32_t lastFlush = 0;
-  static uint32_t lastSend  = 0;
-  static uint32_t lastImuMs = 0;   // track time between IMU samples
+  // Read IMU → update ring buffer + stream
+  static uint32_t lastSend = 0;   // WS throttle
 
   BNO08x_RVC_Data d;
   if (rvc.read(&d)) {
-    const uint32_t tr_us = dev_now_us();  // device time at read (us)
-    const uint32_t t_ms  = dev_now_ms();  // device time at read (ms)
+    const uint32_t tr_us = dev_now_us();   // device time at read (us)
+    const uint32_t t_ms  = dev_now_ms();   // device time at read (ms)
 
-    // IMU gap check
-    if (lastImuMs != 0) {                 // skip first sample
+    // IMU gap + metrics
+    if (lastImuMs != 0) {                  // skip very first sample
       uint32_t dt = t_ms - lastImuMs;
-      if (dt > 25) {                      // only log "real" stalls. typical IMU gap during good performance is ~10 ms
+      if (dt > 15) {
         Serial.printf("IMU GAP %lu ms\n", (unsigned long)dt);
+        imuGapCount++;
       }
+      if (dt > imuGapMaxMs) imuGapMaxMs = dt;
+
+      float fdt = (float)dt;
+      if (imuAvgPeriodMs == 0.0f) imuAvgPeriodMs = fdt;
+      else                        imuAvgPeriodMs = 0.1f * fdt + 0.9f * imuAvgPeriodMs;
+    } else {
+      // first sample of this segment
+      segStartMs = t_ms;
     }
     lastImuMs = t_ms;
-    // end IMU gap check
+    segSamples++;
 
-    // --- throttle WS to ~30 Hz (less blocking) ---
-    if (t_ms - lastSend >= 67) {  // 16 ms ≈ 60 fps, 33 ms ≈ 30 fps,  67 ms ≈ 15 fps
+    // ---------- Ring buffer update (RAM only, no flash writes here) ----------
+    ImuSample &s = ringBuf[ringHead];
+    s.t_ms  = t_ms;
+    s.yaw   = d.yaw;
+    s.pitch = d.pitch;
+    s.roll  = d.roll;
+    s.ax    = d.x_accel;
+    s.ay    = d.y_accel;
+    s.az    = d.z_accel;
+
+    ringHead = (ringHead + 1) % RING_CAP;
+    if (ringHead == 0) ringFilled = true;
+    // ---------- end ring buffer update ----------
+
+    // --- throttle WS to ~15 Hz (lighter streaming) ---
+    if (t_ms - lastSend >= 67) {  // 67 ms ≈ 15 fps
       lastSend = t_ms;
 
-      // Timestamp right before send
-      const uint32_t ts_us  = dev_now_us();
+      const uint32_t ts_us   = dev_now_us();
       const uint32_t thisSeq = ++seqNo;
 
-      // compact JSON for WS UI (with timing)
-      char js[196];
+      // Slimmed JSON: only az + timing
+      char js[128];
       snprintf(js, sizeof(js),
         "{\"type\":\"data\",\"seq\":%lu,\"t\":%lu,\"tr_us\":%lu,\"ts_us\":%lu,"
-        "\"yaw\":%.2f,\"pitch\":%.2f,\"roll\":%.2f,"
-        "\"ax\":%.3f,\"ay\":%.3f,\"az\":%.3f}",
-        (unsigned long)thisSeq, (unsigned long)t_ms,
-        (unsigned long)tr_us, (unsigned long)ts_us,
-        d.yaw, d.pitch, d.roll,
-        d.x_accel, d.y_accel, d.z_accel);
+        "\"az\":%.3f}",
+        (unsigned long)thisSeq,
+        (unsigned long)t_ms,
+        (unsigned long)tr_us,
+        (unsigned long)ts_us,
+        d.z_accel
+      );
 
-      ws.broadcastTXT(js); // TODO FIXME temp disabled to assess data display hiccup
-
-#if ENABLE_LOGGING
-      if (logFile) {
-        logFile.printf("%lu,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,,\n",
-          (unsigned long)t_ms,
-          d.yaw, d.pitch, d.roll,
-          d.x_accel, d.y_accel, d.z_accel);
-
-        // flush once per second instead of every line
-        if (t_ms - lastFlush >= 1000) {
-          lastFlush = t_ms;
-          logFile.flush();
-        }
-      }
-#endif
+      ws.broadcastTXT(js);
     }
   }
 }
-
