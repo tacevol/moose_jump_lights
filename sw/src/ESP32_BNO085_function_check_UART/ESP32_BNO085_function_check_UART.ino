@@ -53,7 +53,6 @@ const WiFiCred WIFI_PRIORITY[] = {
 
 const int WIFI_PRIORITY_COUNT = sizeof(WIFI_PRIORITY) / sizeof(WIFI_PRIORITY[0]);
 
-
 // ---------- Globals ----------
 Adafruit_BNO08x_RVC rvc;
 
@@ -126,6 +125,7 @@ const char PAGE_INDEX[] PROGMEM = R"HTML(
   #canvas{display:block;width:100%;max-width:980px;height:420px;border:1px solid #eee;border-radius:12px;background:#fff}
   .chk{margin-right:10px}
   label{user-select:none}
+  #healthBlock{display:flex;flex-direction:column;align-items:flex-start;gap:4px;margin:6px 0}
 </style>
 
 <h2>IMU Live Plot</h2>
@@ -135,7 +135,6 @@ const char PAGE_INDEX[] PROGMEM = R"HTML(
   <span id=net class=pill>Syncing clock…</span>
   <span id=stats class=pill>rtt=– ms</span>
   <span id=offset class=pill>offset=– ms</span>
-  <span id=health class=pill>health: –</span>
 </div>
 
 <canvas id="canvas" width="1200" height="460"></canvas>
@@ -154,6 +153,14 @@ const char PAGE_INDEX[] PROGMEM = R"HTML(
   <button id="otherBtn">Other…</button>
 </div>
 
+<div id="healthBlock">
+  <div id="healthOverall" class="pill">health: –</div>
+  <div id="healthSamples" class="pill">samples: –</div>
+  <div id="healthGaps" class="pill">gaps: –</div>
+  <div id="healthAvg" class="pill">avg period: –</div>
+  <div id="healthWrite" class="pill">last write: –</div>
+</div>
+
 <div class="row muted" style="font-size:13px">
   <div>Accel Z: m/s^2 (±40 default)</div>
 </div>
@@ -163,7 +170,13 @@ const ipEl = document.getElementById('ip');
 const netEl = document.getElementById('net');
 const rttEl = document.getElementById('stats');
 const offEl = document.getElementById('offset');
-const healthEl = document.getElementById('health');
+
+const healthOverallEl = document.getElementById('healthOverall');
+const healthSamplesEl = document.getElementById('healthSamples');
+const healthGapsEl    = document.getElementById('healthGaps');
+const healthAvgEl     = document.getElementById('healthAvg');
+const healthWriteEl   = document.getElementById('healthWrite');
+
 const cvs = document.getElementById('canvas');
 const ctx = cvs.getContext('2d');
 ipEl.textContent = location.host;
@@ -252,6 +265,14 @@ async function syncClock(samples=8, timeout=500){
   });
 }
 
+function applyHealthColor(bg) {
+  healthOverallEl.style.backgroundColor = bg;
+  healthSamplesEl.style.backgroundColor = bg;
+  healthGapsEl.style.backgroundColor    = bg;
+  healthAvgEl.style.backgroundColor     = bg;
+  healthWriteEl.style.backgroundColor   = bg;
+}
+
 function updateHealthUI(h) {
   // h: { segSamples, imuGapCount, imuGapMaxMs, imuAvgPeriodMs, eventWriteMsLast }
   const samples = h.segSamples ?? 0;
@@ -260,8 +281,12 @@ function updateHealthUI(h) {
   const avg     = h.imuAvgPeriodMs ?? 0;
   const wlast   = h.eventWriteMsLast ?? 0;
 
-  const txt = `samples=${samples}, maxGap=${maxGap}ms, gaps=${gaps}, avg=${avg.toFixed(1)}ms, lastWrite=${wlast}ms`;
-  healthEl.textContent = 'health: ' + txt;
+  // Text per pill (numeric-heavy, as requested)
+  healthOverallEl.textContent = `health: samples=${samples}, maxGap=${maxGap}ms`;
+  healthSamplesEl.textContent = `samples: ${samples}`;
+  healthGapsEl.textContent    = `gaps>25ms: ${gaps}, max=${maxGap}ms`;
+  healthAvgEl.textContent     = `avg period: ${avg.toFixed(1)}ms`;
+  healthWriteEl.textContent   = `last write: ${wlast}ms`;
 
   // Color code: green/yellow/red based on timing quality
   let bg = '#c8e6c9'; // green default
@@ -270,7 +295,7 @@ function updateHealthUI(h) {
   } else if (maxGap > 40 || wlast > 800) {
     bg = '#fff9c4';   // yellow
   }
-  healthEl.style.backgroundColor = bg;
+  applyHealthColor(bg);
 }
 
 // WebSocket
@@ -427,7 +452,7 @@ requestAnimationFrame(render);
 
 // ---------- Wi-Fi / OTA ----------
 
-// Use user's multi-SSID connectWiFi
+// Multi-SSID connectWiFi from your setup
 static void connectWiFi() {
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(false);  // we'll manage it ourselves here
