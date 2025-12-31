@@ -1,14 +1,16 @@
 /**************************************************************************
   Seeed studio XIAO ESP32C3
-  BNO085 UART-RVC + OTA + WebSocket + Event-Window Logging + Live Plot
+  BNO085 UART-RVC + OTA + WebSocket + Event-Window Logging + Live Plot + Health
 
-  - HTTP (port 80): serves the web UI with a canvas plot and checkboxes
-  - WebSocket (port 81): real-time JSON stream + control/events
+  - HTTP (port 80): serves the web UI with a canvas plot and controls
+  - WebSocket (port 81): real-time JSON stream (az only) + control/events/health
+  - Continuous logging into RAM ring buffer (~30 s of IMU history)
   - On "catch/miss/other" event:
-      * Take a snapshot of the last PRE_WINDOW_MS of IMU data from RAM
-      * Write that window to a new CSV
+      * Take a snapshot of the last PRE_WINDOW_MS from ring buffer
+      * Keep only data from the current session (since "New Session")
+      * Write that window to a new CSV file
       * Append an event row
-      * Close file and reset segment metrics
+      * Close file and resume logging
  **************************************************************************/
 
 #include <WiFi.h>
@@ -19,19 +21,6 @@
 #include <LittleFS.h>
 #include "secrets.h"
 #include <Adafruit_NeoPixel.h>
-
-// WiFi priority list: earlier entries are higher priority
-struct WiFiCred {
-  const char* ssid;
-  const char* pass;
-};
-
-const WiFiCred WIFI_PRIORITY[] = {
-  { WIFI_SSID_HOTSPOT, WIFI_PASS_HOTSPOT },  // #1: field hotspot
-  { WIFI_SSID_HOME,    WIFI_PASS_HOME    },  // #2: home WiFi
-};
-
-const int WIFI_PRIORITY_COUNT = sizeof(WIFI_PRIORITY) / sizeof(WIFI_PRIORITY[0]);
 
 // ---------- Pins ----------
 #define BNO_RX_PIN    20   // XIAO ESP32C3 RX header (wired to BNO085 SDA / sensor TX)
@@ -49,7 +38,21 @@ Adafruit_NeoPixel pixels(
 // ---------- Feature toggles ----------
 #define ENABLE_LOGGING    1    // 0: disable file writes, 1: enable event-window logging
 #define DIAG_TIMING       0    // 1: print timing deltas on Serial (adds jitter)
-#define FORCE_FORMAT_FS   0    // 1: format LittleFS on boot (use once to clear old logs, then set back to 0)
+#define FORCE_FORMAT_FS   0    // 1: format LittleFS on boot ONCE to wipe old logs
+
+// WiFi priority list: earlier entries are higher priority
+struct WiFiCred {
+  const char* ssid;
+  const char* pass;
+};
+
+const WiFiCred WIFI_PRIORITY[] = {
+  { WIFI_SSID_HOTSPOT, WIFI_PASS_HOTSPOT },  // #1: field hotspot
+  { WIFI_SSID_HOME,    WIFI_PASS_HOME    },  // #2: home WiFi
+};
+
+const int WIFI_PRIORITY_COUNT = sizeof(WIFI_PRIORITY) / sizeof(WIFI_PRIORITY[0]);
+
 
 // ---------- Globals ----------
 Adafruit_BNO08x_RVC rvc;
@@ -67,12 +70,9 @@ static inline uint32_t dev_now_ms() { return millis(); }
 static inline uint32_t dev_now_us() { return micros(); }
 
 // ---------- Ring buffer for pre-event logging (RAM only) ----------
-// We want a ~30s pre-event window.
-// At ~100 Hz, that is ~3000 samples. These are related but not identical:
-// PRE_WINDOW_MS is a time window; RING_CAP is the max number of samples we store.
+// We want a ~30s pre-event window at ~100 Hz.
 const uint32_t PRE_WINDOW_MS = 30000;  // 30 seconds of history
 const size_t   RING_CAP      = 3000;   // max samples in ring
-uint32_t sessionStartMs = 0; // timestamp when we hit New Session button
 
 struct ImuSample {
   uint32_t t_ms;
@@ -84,21 +84,25 @@ ImuSample ringBuf[RING_CAP];
 size_t    ringHead      = 0;   // next write index
 bool      ringFilled    = false;
 
-// Segment / health metrics (reset per segment/event)
-uint32_t segSamples      = 0;
-uint32_t segStartMs      = 0;
-uint32_t imuGapCount     = 0;
-uint32_t imuGapMaxMs     = 0;
-float    imuAvgPeriodMs  = 0.0f;
-uint32_t lastImuMs       = 0;
+// Session & metrics
+uint32_t sessionStartMs   = 0;   // when "New Session" was last pressed
+
+uint32_t segSamples       = 0;   // IMU samples since session start
+uint32_t segStartMs       = 0;   // time of first IMU sample in session
+uint32_t imuGapCount      = 0;   // count of IMU dt > threshold
+uint32_t imuGapMaxMs      = 0;   // max observed IMU dt
+float    imuAvgPeriodMs   = 0.0f; // EWMA of IMU dt
+uint32_t lastImuMs        = 0;   // time of last IMU sample
+uint32_t eventWriteMsLast = 0;   // duration of last event segment write (ms)
 
 void resetSegmentMetrics() {
-  segSamples     = 0;
-  segStartMs     = 0;
-  imuGapCount    = 0;
-  imuGapMaxMs    = 0;
-  imuAvgPeriodMs = 0.0f;
-  lastImuMs      = 0;
+  segSamples       = 0;
+  segStartMs       = 0;
+  imuGapCount      = 0;
+  imuGapMaxMs      = 0;
+  imuAvgPeriodMs   = 0.0f;
+  lastImuMs        = 0;
+  eventWriteMsLast = 0;
 }
 
 // ---------- HTML UI (served from flash) ----------
@@ -114,7 +118,7 @@ const char PAGE_INDEX[] PROGMEM = R"HTML(
   .row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:6px 0}
   button{padding:8px 12px;border:1px solid #ccc;border-radius:10px;background:#f6f6f6;cursor:pointer}
   button:active{transform:translateY(1px)}
-  .pill{display:inline-block;padding:2px 8px;border:1px solid #ccc;border-radius:999px;color:#333}
+  .pill{display:inline-block;padding:2px 8px;border:1px solid #ccc;border-radius:999px;color:#333;font-size:12px}
   #legend{display:flex;gap:10px;flex-wrap:wrap}
   .lg{display:flex;align-items:center;gap:6px;font-size:13px}
   .sw{width:16px;height:16px;border-radius:4px;border:1px solid #aaa;display:inline-block}
@@ -131,6 +135,7 @@ const char PAGE_INDEX[] PROGMEM = R"HTML(
   <span id=net class=pill>Syncing clock…</span>
   <span id=stats class=pill>rtt=– ms</span>
   <span id=offset class=pill>offset=– ms</span>
+  <span id=health class=pill>health: –</span>
 </div>
 
 <canvas id="canvas" width="1200" height="460"></canvas>
@@ -158,6 +163,7 @@ const ipEl = document.getElementById('ip');
 const netEl = document.getElementById('net');
 const rttEl = document.getElementById('stats');
 const offEl = document.getElementById('offset');
+const healthEl = document.getElementById('health');
 const cvs = document.getElementById('canvas');
 const ctx = cvs.getContext('2d');
 ipEl.textContent = location.host;
@@ -166,7 +172,7 @@ let ws;
 
 // Series config: ONLY az for now
 const series = [
-  { key:'az',    color:'#f4511e', enabled:true,  kind:'acc' },
+  { key:'az', color:'#f4511e', enabled:true, kind:'acc' },
 ];
 
 const BUFFER = 1200;     // ring buffer for plotting (host-side only)
@@ -199,12 +205,12 @@ document.getElementById('pauseBtn').onclick = ()=>{
   paused = !paused;
   document.getElementById('pauseBtn').textContent = paused ? 'Resume' : 'Pause';
 };
-document.getElementById('rotateBtn').onclick = ()=> ws.send(JSON.stringify({ type:'rotate' }));
-document.getElementById('catchBtn').onclick  = ()=> ws.send(JSON.stringify({ type:'event', kind:'catch', note:'', t: Date.now() }));
-document.getElementById('missBtn').onclick   = ()=> ws.send(JSON.stringify({ type:'event', kind:'miss',  note:'', t: Date.now() }));
+document.getElementById('rotateBtn').onclick = ()=> ws && ws.send(JSON.stringify({ type:'rotate' }));
+document.getElementById('catchBtn').onclick  = ()=> ws && ws.send(JSON.stringify({ type:'event', kind:'catch', note:'', t: Date.now() }));
+document.getElementById('missBtn').onclick   = ()=> ws && ws.send(JSON.stringify({ type:'event', kind:'miss',  note:'', t: Date.now() }));
 document.getElementById('otherBtn').onclick  = ()=>{
   const note = prompt('Describe event:') || '';
-  ws.send(JSON.stringify({ type:'event', kind:'other', note, t: Date.now() }));
+  ws && ws.send(JSON.stringify({ type:'event', kind:'other', note, t: Date.now() }));
 };
 
 // Time sync (Cristian) with EWMA
@@ -246,6 +252,27 @@ async function syncClock(samples=8, timeout=500){
   });
 }
 
+function updateHealthUI(h) {
+  // h: { segSamples, imuGapCount, imuGapMaxMs, imuAvgPeriodMs, eventWriteMsLast }
+  const samples = h.segSamples ?? 0;
+  const maxGap  = h.imuGapMaxMs ?? 0;
+  const gaps    = h.imuGapCount ?? 0;
+  const avg     = h.imuAvgPeriodMs ?? 0;
+  const wlast   = h.eventWriteMsLast ?? 0;
+
+  const txt = `samples=${samples}, maxGap=${maxGap}ms, gaps=${gaps}, avg=${avg.toFixed(1)}ms, lastWrite=${wlast}ms`;
+  healthEl.textContent = 'health: ' + txt;
+
+  // Color code: green/yellow/red based on timing quality
+  let bg = '#c8e6c9'; // green default
+  if (maxGap > 120 || wlast > 2000) {
+    bg = '#ffcdd2';   // red
+  } else if (maxGap > 40 || wlast > 800) {
+    bg = '#fff9c4';   // yellow
+  }
+  healthEl.style.backgroundColor = bg;
+}
+
 // WebSocket
 function openWS() {
   ws = new WebSocket('ws://' + location.hostname + ':81');
@@ -267,8 +294,15 @@ function openWS() {
       return;
     }
 
+    if (d.type === 'health') {
+      updateHealthUI(d);
+      return;
+    }
+
     if (d.type === 'ack' || d.type === 'sync') return;
     if (paused) return;
+
+    if (d.type !== 'data') return; // ignore unknown types here
 
     const hostNow = performance.now();
 
@@ -278,7 +312,7 @@ function openWS() {
       const dHost = hostNow - lastHost;  // ms between arrivals in browser
 
       // Host jitter check (for debugging streaming health)
-      if (dHost > 150) {  // raise threshold; only log truly big stalls
+      if (dHost > 150) {
         console.log(
           'BIG HOST GAP',
           dSeq, 'samples,',
@@ -392,6 +426,8 @@ requestAnimationFrame(render);
 )HTML";
 
 // ---------- Wi-Fi / OTA ----------
+
+// Use user's multi-SSID connectWiFi
 static void connectWiFi() {
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(false);  // we'll manage it ourselves here
@@ -524,54 +560,55 @@ void wsEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t len) {
       // Reset per-segment metrics
       resetSegmentMetrics();
 
-      #if ENABLE_LOGGING
-        // Optional: delete the last CSV to keep FS clean once you've downloaded it
-        if (currentLogName[0] && LittleFS.exists(currentLogName)) {
-          LittleFS.remove(currentLogName);
-        }
-        currentLogName[0] = '\0';
-      #endif
+#if ENABLE_LOGGING
+      // Optional: delete the last CSV once you've downloaded it
+      if (currentLogName[0] && LittleFS.exists(currentLogName)) {
+        LittleFS.remove(currentLogName);
+      }
+      currentLogName[0] = '\0';
+#endif
 
-        ws.sendTXT(num, "{\"type\":\"ack\",\"cmd\":\"rotate\"}");
-        return;
+      ws.sendTXT(num, "{\"type\":\"ack\",\"cmd\":\"rotate\"}");
+      return;
     }
 
     // event with optional note (flush pre-window from ring buffer to CSV)
-    String kind = "", note = "";
-    int k2 = msg.indexOf("\"kind\":\"");
-    if (k2 >= 0) {
-      int s = k2 + 8;
-      int e = msg.indexOf("\"", s);
-      if (e > s) kind = msg.substring(s, e);
-    }
-    int n = msg.indexOf("\"note\":\"");
-    if (n >= 0) {
-      int s = n + 8;
-      int e = msg.indexOf("\"", s);
-      if (e > s) {
-        note = msg.substring(s, e);
-        note.replace(",", " ");  // keep CSV clean
+    if (msg.indexOf("\"type\":\"event\"") >= 0) {
+      String kind = "", note = "";
+      int k2 = msg.indexOf("\"kind\":\"");
+      if (k2 >= 0) {
+        int s = k2 + 8;
+        int e = msg.indexOf("\"", s);
+        if (e > s) kind = msg.substring(s, e);
       }
-    }
+      int n = msg.indexOf("\"note\":\"");
+      if (n >= 0) {
+        int s = n + 8;
+        int e = msg.indexOf("\"", s);
+        if (e > s) {
+          note = msg.substring(s, e);
+          note.replace(",", " ");  // keep CSV clean
+        }
+      }
 
-  uint32_t t_event = dev_now_ms();
+      uint32_t t_event = dev_now_ms();
+      uint32_t writeStart = t_event;
 
-
-  #if ENABLE_LOGGING
+#if ENABLE_LOGGING
       // Create a new segment file for this event
       rotateLog();  // sets currentLogName and opens logFile
 
       if (logFile) {
-        // Base: 30s window
+        // Base: 30 s window
         const uint32_t baseStart =
           (t_event > PRE_WINDOW_MS) ? (t_event - PRE_WINDOW_MS) : 0;
 
-        // Don't include samples from before the current sesion
-        const uint32_t windowStart = 
+        // Don't include samples from before the current session
+        const uint32_t windowStart =
           (sessionStartMs > baseStart) ? sessionStartMs : baseStart;
 
         size_t count = ringFilled ? RING_CAP : ringHead;
-        size_t idx = ringFilled ? ringHead : 0; // oldest
+        size_t idx   = ringFilled ? ringHead : 0;  // oldest
 
         for (size_t i = 0; i < count; ++i) {
           const ImuSample &s = ringBuf[idx];
@@ -600,13 +637,18 @@ void wsEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t len) {
         logFile.flush();
         logFile.close();
       }
-  #endif
+#endif
 
-      // Reset metrics for the next segment
+      uint32_t writeEnd = dev_now_ms();
+      eventWriteMsLast  = writeEnd - writeStart;
+
+      // Reset per-event metrics for next segment
       resetSegmentMetrics();
+      // sessionStartMs is NOT reset here; that is only via "New Session"
 
       ws.sendTXT(num, "{\"type\":\"ack\",\"cmd\":\"event\"}");
     }
+  }
 }
 
 // ---------- Setup ----------
@@ -619,50 +661,48 @@ void setup() {
   Serial.print("Free heap: ");
   Serial.println(ESP.getFreeHeap());
 
-  // ---------- LittleFS init / optional format ---------- 
+  // ---------- LittleFS init / optional format ----------
+  if (!LittleFS.begin()) {
+    Serial.println("LittleFS mount failed, trying to format...");
+    if (LittleFS.format()) {
+      Serial.println("LittleFS format OK, remounting...");
+      if (!LittleFS.begin()) {
+        Serial.println("LittleFS remount failed after format!");
+      }
+    } else {
+      Serial.println("LittleFS format FAILED!");
+    }
+  } else {
+    Serial.println("LittleFS mounted OK.");
+  }
+
+#if FORCE_FORMAT_FS
+  Serial.println("FORCE_FORMAT_FS=1 → formatting LittleFS...");
+  if (LittleFS.format()) {
+    Serial.println("Forced format OK, remounting LittleFS...");
     if (!LittleFS.begin()) {
-      Serial.println("LittleFS mount failed, trying to format...");
-      if (LittleFS.format()) {
-        Serial.println("LittleFS format OK, remounting...");
-        if (!LittleFS.begin()) {
-          Serial.println("LittleFS remount failed after format!");
-        }
-      } else {
-        Serial.println("LittleFS format FAILED!");
-      }
-    } else {
-      Serial.println("LittleFS mounted OK.");
+      Serial.println("LittleFS remount failed after forced format!");
     }
+  } else {
+    Serial.println("Forced LittleFS format FAILED!");
+  }
+#endif
 
-    #if FORCE_FORMAT_FS
-      Serial.println("FORCE_FORMAT_FS=1 → formatting LittleFS...");
-      if (LittleFS.format()) {
-        Serial.println("Forced format OK, remounting LittleFS...");
-        if (!LittleFS.begin()) {
-          Serial.println("LittleFS remount failed after forced format!");
-        }
-      } else {
-        Serial.println("Forced LittleFS format FAILED!");
-      }
-    #endif
-
-    // Print FS stats so we know how big the partition actually is
-    if (LittleFS.begin()) {
-      size_t total = LittleFS.totalBytes();
-      size_t used  = LittleFS.usedBytes();
-      size_t freeB = (total > used) ? (total - used) : 0;
-      Serial.printf("LittleFS: total=%u bytes, used=%u, free=%u\n",
-                    (unsigned)total, (unsigned)used, (unsigned)freeB);
-    } else {
-      Serial.println("LittleFS still not mounted, logging disabled.");
-    }
+  if (LittleFS.begin()) {
+    size_t total = LittleFS.totalBytes();
+    size_t used  = LittleFS.usedBytes();
+    size_t freeB = (total > used) ? (total - used) : 0;
+    Serial.printf("LittleFS: total=%u bytes, used=%u, free=%u\n",
+                  (unsigned)total, (unsigned)used, (unsigned)freeB);
+  } else {
+    Serial.println("LittleFS still not mounted, logging disabled.");
+  }
 
   currentLogName[0] = '\0';
   resetSegmentMetrics();
 
   // Start initial session at boot
   sessionStartMs = dev_now_ms();
-
 
   WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info){
     if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
@@ -695,9 +735,8 @@ void setup() {
   Serial.println("WebSocket port: 81");
 
   pixels.begin();
-  pixels.setBrightness(100);   // keep 0-255, keep <120 for LiPo to prevent voltage sag/brownout
+  pixels.setBrightness(100);   // keep <120 for LiPo to prevent sag/brownout
   pixels.clear();
-  // pixels.show();
 }
 
 // ---------- Loop ----------
@@ -707,12 +746,10 @@ void loop() {
 
   if (millis() - lastIpPrint > 5000) {
     lastIpPrint = millis();
-    Serial.print("IP: ");
-    Serial.print(WiFi.localIP());
-    Serial.print(" | Status: ");
-    Serial.println((int)WiFi.status()); // 3 = WL_CONNECTED
+    Serial.printf("IP: %s | Status: %d\n",
+                  WiFi.localIP().toString().c_str(),
+                  (int)WiFi.status()); // 3 = WL_CONNECTED
   }
-  // end IP check
 
   // temp LED check
   static uint32_t lastUpdate = 0;
@@ -727,10 +764,8 @@ void loop() {
 
     pixels.setPixelColor(0, c1);
     pixels.setPixelColor(1, c2);
-    pixels.clear(); // delete me?
-    // pixels.show();
+    pixels.clear(); // still just a test pattern; not calling show()
   }
-  // end LED check
 
 #if DIAG_TIMING
   static uint32_t lastReadMicros = 0;
@@ -745,6 +780,27 @@ void loop() {
   http.handleClient();
   ws.loop();
 
+  // Health telemetry: send ~1 Hz
+  static uint32_t lastHealthMs = 0;
+  uint32_t nowMs = dev_now_ms();
+  if (nowMs - lastHealthMs >= 1000) {
+    lastHealthMs = nowMs;
+
+    // health message: per-session metrics
+    char hbuf[196];
+    snprintf(hbuf, sizeof(hbuf),
+      "{\"type\":\"health\",\"segSamples\":%lu,"
+      "\"imuGapCount\":%lu,\"imuGapMaxMs\":%lu,"
+      "\"imuAvgPeriodMs\":%.2f,\"eventWriteMsLast\":%lu}",
+      (unsigned long)segSamples,
+      (unsigned long)imuGapCount,
+      (unsigned long)imuGapMaxMs,
+      (double)imuAvgPeriodMs,
+      (unsigned long)eventWriteMsLast
+    );
+    ws.broadcastTXT(hbuf);
+  }
+
   // Read IMU → update ring buffer + stream
   static uint32_t lastSend = 0;   // WS throttle
 
@@ -756,7 +812,7 @@ void loop() {
     // IMU gap + metrics
     if (lastImuMs != 0) {                  // skip very first sample
       uint32_t dt = t_ms - lastImuMs;
-      if (dt > 15) {
+      if (dt > 25) {
         Serial.printf("IMU GAP %lu ms\n", (unsigned long)dt);
         imuGapCount++;
       }
@@ -766,7 +822,7 @@ void loop() {
       if (imuAvgPeriodMs == 0.0f) imuAvgPeriodMs = fdt;
       else                        imuAvgPeriodMs = 0.1f * fdt + 0.9f * imuAvgPeriodMs;
     } else {
-      // first sample of this segment
+      // first sample of this session
       segStartMs = t_ms;
     }
     lastImuMs = t_ms;
