@@ -8,3 +8,13 @@ build/
 #private credentials
 **/secrets.h
 data/
+# Python
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+# Analysis outputs
+analysis/*.png
+analysis/*.csv
+analysis/*.pkl
+analysis/*.html
