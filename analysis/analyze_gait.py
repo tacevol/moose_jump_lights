@@ -16,7 +16,7 @@ from pathlib import Path
 from scipy import signal
 from scipy.fft import fft, fftfreq
 
-DATA_DIR = Path(__file__).parent.parent / "data" / "2026-01-03"
+DATA_DIR = Path(__file__).parent.parent / "data" / "2026-01-04"
 ANALYSIS_DIR = Path(__file__).parent
 
 # Expected cadence: 3 steps per second = 3 Hz
@@ -300,6 +300,7 @@ def plot_gait_analysis(results_list, save_path=None):
         
         # Create subplots: 6 rows stacked vertically
         # (accel mag, az, pitch, yaw, roll, FFT)
+        # shared_xaxes=True links x-axes so zoom/pan is synchronized across plots
         fig = make_subplots(
             rows=6, cols=1,
             subplot_titles=(
@@ -310,7 +311,8 @@ def plot_gait_analysis(results_list, save_path=None):
                 f"{filename} - Roll",
                 f"{filename} - FFT Spectrum (All Signals)"
             ),
-            vertical_spacing=0.08
+            vertical_spacing=0.08,
+            shared_xaxes=True  # Link x-axes - zoom/pan on any time series plot synchronizes all
         )
         
         # Time series - acceleration magnitude
@@ -488,17 +490,19 @@ def plot_gait_analysis(results_list, save_path=None):
             )
         
         # Update axes labels
+        # Note: With shared_xaxes=True, rows 1-5 will share the same x-axis (time)
+        # Row 6 (FFT) will have its own x-axis (frequency) - Plotly handles this automatically
         fig.update_xaxes(title_text="Time (s)", row=1, col=1)
         fig.update_yaxes(title_text="Accel Magnitude (m/s²)", row=1, col=1)
-        fig.update_xaxes(title_text="Time (s)", row=2, col=1)
+        fig.update_xaxes(title_text="", row=2, col=1)  # Empty title since shared with row 1
         fig.update_yaxes(title_text="az (m/s²)", row=2, col=1)
-        fig.update_xaxes(title_text="Time (s)", row=3, col=1)
+        fig.update_xaxes(title_text="", row=3, col=1)
         fig.update_yaxes(title_text="Pitch (degrees)", row=3, col=1)
-        fig.update_xaxes(title_text="Time (s)", row=4, col=1)
+        fig.update_xaxes(title_text="", row=4, col=1)
         fig.update_yaxes(title_text="Yaw (degrees)", row=4, col=1)
-        fig.update_xaxes(title_text="Time (s)", row=5, col=1)
+        fig.update_xaxes(title_text="Time (s)", row=5, col=1)  # Show title on last time series plot
         fig.update_yaxes(title_text="Roll (degrees)", row=5, col=1)
-        fig.update_xaxes(title_text="Frequency (Hz)", row=6, col=1)
+        fig.update_xaxes(title_text="Frequency (Hz)", row=6, col=1)  # Separate axis for FFT
         fig.update_yaxes(title_text="Power (log scale)", row=6, col=1, type="log")  # Log scale for power
         
         fig.update_layout(

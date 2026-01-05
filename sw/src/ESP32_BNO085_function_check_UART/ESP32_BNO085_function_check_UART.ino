@@ -3,7 +3,7 @@
   BNO085 UART-RVC + OTA + WebSocket + Event-Window Logging + Live Plot + Health
 
   - HTTP (port 80): serves the web UI with a canvas plot and controls
-  - WebSocket (port 81): real-time JSON stream (az only) + control/events/health
+  - WebSocket (port 81): real-time JSON stream (accel_mag) + control/events/health
   - Continuous logging into RAM ring buffer (~30 s of IMU history)
   - On "catch/miss/other" event:
       * Take a snapshot of the last PRE_WINDOW_MS from ring buffer
@@ -37,6 +37,8 @@ Adafruit_NeoPixel pixels(
 
 // ---------- Feature toggles ----------
 #define ENABLE_LOGGING    1    // 0: disable file writes, 1: enable event-window logging
+#define ENABLE_LED_CONTROL 1   // 0: disable LED control, 1: enable real-time LED updates
+#define LED_MODE          3    // 1: threshold, 2: gait pulse, 3: smooth brightness, 4: fast threshold
 #define DIAG_TIMING       0    // 1: print timing deltas on Serial (adds jitter)
 #define FORCE_FORMAT_FS   0    // 1: format LittleFS on boot ONCE to wipe old logs
 
@@ -68,6 +70,172 @@ volatile uint32_t seqNo = 0;
 static inline uint32_t dev_now_ms() { return millis(); }
 static inline uint32_t dev_now_us() { return micros(); }
 
+// ---------- Acceleration magnitude calculation ----------
+// Fast, real-time calculation: sqrt(ax² + ay² + az²)
+// Returns magnitude in m/s²
+static inline float calcAccelMag(float ax, float ay, float az) {
+  return sqrt(ax*ax + ay*ay + az*az);
+}
+
+// Alternative: squared magnitude (faster, use for thresholding)
+// Use this when you only need to compare against thresholds
+static inline float calcAccelMagSq(float ax, float ay, float az) {
+  return ax*ax + ay*ay + az*az;
+}
+
+// ---------- LED Control Functions ----------
+#if ENABLE_LED_CONTROL
+
+// LED Mode 1: Simple threshold - LED brightness based on magnitude
+void updateLEDsFromAccel(float accel_mag) {
+  const float THRESHOLD_LOW  = 10.0f;   // m/s² - normal walking
+  const float THRESHOLD_MED  = 20.0f;   // m/s² - running
+  const float THRESHOLD_HIGH = 40.0f;   // m/s² - jumping
+  
+  uint8_t brightness = 0;
+  uint32_t color = 0;
+  
+  if (accel_mag < THRESHOLD_LOW) {
+    // Walking - dim green
+    brightness = 32;
+    color = pixels.Color(0, brightness, 0);  // Green
+  } else if (accel_mag < THRESHOLD_MED) {
+    // Running - medium yellow
+    brightness = 128;
+    color = pixels.Color(brightness, brightness, 0);  // Yellow
+  } else if (accel_mag < THRESHOLD_HIGH) {
+    // Fast running - bright orange
+    brightness = 200;
+    color = pixels.Color(brightness, brightness/2, 0);  // Orange
+  } else {
+    // Jumping - bright red
+    brightness = 255;
+    color = pixels.Color(brightness, 0, 0);  // Red
+  }
+  
+  pixels.setPixelColor(0, color);
+  pixels.setPixelColor(1, color);
+  pixels.show();
+}
+
+// LED Mode 2: Pulse LED based on gait cadence
+// This detects the periodic pattern in acceleration magnitude
+void updateLEDsGaitPulse(float accel_mag) {
+  static float last_mag = 0.0f;
+  static uint32_t last_peak_ms = 0;
+  static float peak_mag = 0.0f;
+  
+  uint32_t now = millis();
+  
+  // Detect peak (simple peak detection)
+  if (accel_mag > last_mag && accel_mag > 15.0f) {
+    // Rising edge, potential peak
+    peak_mag = accel_mag;
+  } else if (accel_mag < last_mag && last_mag > 15.0f) {
+    // Falling edge after peak - flash LED
+    uint32_t period = now - last_peak_ms;
+    if (period > 200 && period < 1000) {  // 2-10 Hz cadence range
+      // Flash LED on each step
+      pixels.setPixelColor(0, pixels.Color(255, 255, 255));
+      pixels.setPixelColor(1, pixels.Color(255, 255, 255));
+      pixels.show();
+      delay(50);  // Brief flash
+      pixels.clear();
+      pixels.show();
+      
+      last_peak_ms = now;
+    }
+  }
+  
+  last_mag = accel_mag;
+}
+
+// LED Mode 3: Smooth rainbow color change based on magnitude (with low-pass filter)
+// Constant brightness, color transitions through full rainbow spectrum
+void updateLEDsSmooth(float accel_mag) {
+  static float filtered_mag = 0.0f;
+  const float ALPHA = 0.1f;  // Low-pass filter coefficient (0-1, lower = smoother)
+  
+  // Exponential moving average filter
+  filtered_mag = ALPHA * accel_mag + (1.0f - ALPHA) * filtered_mag;
+  
+  // Map magnitude to hue (0-65535 for ColorHSV, representing 0-360 degrees)
+  // Adjust these values based on your dog's typical range
+  const float MAG_MIN = 5.0f;   // Minimum expected magnitude
+  const float MAG_MAX = 20.0f;  // Maximum expected magnitude
+  
+  const uint8_t BRIGHTNESS = 255;  // Constant brightness level (0-255)
+  const uint8_t SATURATION = 255;  // Full saturation for vibrant colors
+  
+  // Map filtered magnitude to hue (0-65535 = 0-360 degrees)
+  // Start at blue (240 degrees) and cycle through rainbow to red (0 degrees)
+  uint16_t hue = 0;
+  
+  if (filtered_mag < MAG_MIN) {
+    // Below minimum - blue/violet (start of rainbow)
+    hue = 43690;  // 240 degrees (blue)
+  } else if (filtered_mag >= MAG_MAX) {
+    // Above maximum - red (end of rainbow)
+    hue = 0;  // 0 degrees (red)
+  } else {
+    // Map from MAG_MIN to MAG_MAX across full rainbow spectrum
+    // Blue (240°) -> Cyan -> Green -> Yellow -> Orange -> Red (0°)
+    float normalized = (filtered_mag - MAG_MIN) / (MAG_MAX - MAG_MIN);  // 0.0 to 1.0
+    
+    // HSV hue: 0 = red, 65535 = also red (full circle)
+    // We want: blue (240°) at 0.0, red (0°) at 1.0
+    // So we go from 240° backwards through the spectrum
+    float hue_degrees = 240.0f - (normalized * 240.0f);  // 240° down to 0°
+    if (hue_degrees < 0.0f) hue_degrees += 360.0f;  // Wrap if needed
+    
+    hue = (uint16_t)(hue_degrees * 65535.0f / 360.0f);  // Convert to 16-bit hue
+  }
+  
+  // Convert HSV to RGB (ColorHSV: hue 0-65535, saturation 0-255, value 0-255)
+  uint32_t color = pixels.ColorHSV(hue, SATURATION, BRIGHTNESS);
+  
+  pixels.setPixelColor(0, color);
+  pixels.setPixelColor(1, color);
+  pixels.show();
+}
+
+// LED Mode 4: Use squared magnitude for faster thresholding (no sqrt)
+void updateLEDsFastThreshold(float ax, float ay, float az) {
+  // Calculate squared magnitude (faster - no sqrt)
+  float mag_sq = calcAccelMagSq(ax, ay, az);
+  
+  // Compare against squared thresholds
+  const float THRESHOLD_SQ_LOW  = 10.0f * 10.0f;   // 100
+  const float THRESHOLD_SQ_HIGH = 30.0f * 30.0f;   // 900
+  
+  if (mag_sq < THRESHOLD_SQ_LOW) {
+    pixels.setPixelColor(0, pixels.Color(0, 50, 0));    // Dim green
+    pixels.setPixelColor(1, pixels.Color(0, 50, 0));
+  } else if (mag_sq < THRESHOLD_SQ_HIGH) {
+    pixels.setPixelColor(0, pixels.Color(100, 100, 0)); // Yellow
+    pixels.setPixelColor(1, pixels.Color(100, 100, 0));
+  } else {
+    pixels.setPixelColor(0, pixels.Color(255, 0, 0));    // Red
+    pixels.setPixelColor(1, pixels.Color(255, 0, 0));
+  }
+  pixels.show();
+}
+
+// Main LED update function - calls the appropriate mode
+void updateLEDs(float accel_mag, float ax, float ay, float az) {
+  #if LED_MODE == 1
+    updateLEDsFromAccel(accel_mag);
+  #elif LED_MODE == 2
+    updateLEDsGaitPulse(accel_mag);
+  #elif LED_MODE == 3
+    updateLEDsSmooth(accel_mag);
+  #elif LED_MODE == 4
+    updateLEDsFastThreshold(ax, ay, az);
+  #endif
+}
+
+#endif // ENABLE_LED_CONTROL
+
 // ---------- Ring buffer for pre-event logging (RAM only) ----------
 // We want a ~30s pre-event window at ~100 Hz.
 const uint32_t PRE_WINDOW_MS = 30000;  // 30 seconds of history
@@ -77,6 +245,7 @@ struct ImuSample {
   uint32_t t_ms;
   float yaw, pitch, roll;
   float ax, ay, az;
+  float accel_mag;  // acceleration magnitude (calculated on-the-fly)
 };
 
 ImuSample ringBuf[RING_CAP];
@@ -162,7 +331,7 @@ const char PAGE_INDEX[] PROGMEM = R"HTML(
 </div>
 
 <div class="row muted" style="font-size:13px">
-  <div>Accel Z: m/s^2 (±40 default)</div>
+  <div>Accel Magnitude: m/s^2 (±50 default)</div>
 </div>
 
 <script>
@@ -183,9 +352,9 @@ ipEl.textContent = location.host;
 
 let ws;
 
-// Series config: ONLY az for now
+// Series config: accel_mag
 const series = [
-  { key:'az', color:'#f4511e', enabled:true, kind:'acc' },
+  { key:'accel_mag', color:'#f4511e', enabled:true, kind:'acc' },
 ];
 
 const BUFFER = 1200;     // ring buffer for plotting (host-side only)
@@ -196,7 +365,7 @@ let head = 0;
 let paused = false;
 
 // Ranges
-const FIXED = { acc:[-40,40] };
+const FIXED = { acc:[0,50] };  // [min, max] for acceleration magnitude (always >= 0)
 const autoscaleEl = document.getElementById('autoscale');
 
 // UI legend + checkboxes
@@ -352,9 +521,9 @@ function openWS() {
     lastDevT = d.t;
     lastHost = hostNow;
 
-    // push into ring buffer for plotting (az only)
+    // push into ring buffer for plotting (accel_mag)
     data.t[head]  = d.t;
-    data.az[head] = ('az' in d) ? d.az : null;
+    data.accel_mag[head] = ('accel_mag' in d) ? d.accel_mag : null;
     head = (head + 1) % BUFFER;
   };
 
@@ -381,7 +550,8 @@ function getRange(kind){
   if (lo===hi){ lo-=1; hi+=1; }
   // add 10% headroom
   const pad = (hi-lo)*0.1;
-  return [lo-pad, hi+pad];
+  lo = Math.max(0, lo-pad);  // Ensure lo >= 0 for magnitude
+  return [lo, hi+pad];
 }
 
 function drawGrid(x, y, w, h, ylo, yhi, label){
@@ -437,9 +607,9 @@ function render(){
   const w = cvs.width - pad*2;
   const h = cvs.height - pad*2;
 
-  // Single panel: accel Z
-  const [accLo,accHi] = getRange('acc');
-  drawGrid(pad, pad, w, h, accLo, accHi, 'az (m/s^2)');
+  // Single panel: accel magnitude
+  const [accLo, accHi] = getRange('acc');
+  drawGrid(pad, pad, w, h, accLo, accHi, 'Accel Magnitude (m/s^2)');
   series.filter(s=>s.kind==='acc' && s.enabled).forEach(s=>{
     drawSeries(data[s.key], s.color, pad, pad, w, h, accLo, accHi);
   });
@@ -645,6 +815,7 @@ void wsEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t len) {
               (unsigned long)s.t_ms,
               s.yaw, s.pitch, s.roll,
               s.ax, s.ay, s.az
+              // Note: accel_mag is calculated from ax,ay,az, so we don't need to store it
             );
           }
 
@@ -760,7 +931,7 @@ void setup() {
   Serial.println("WebSocket port: 81");
 
   pixels.begin();
-  pixels.setBrightness(100);   // keep <120 for LiPo to prevent sag/brownout
+  pixels.setBrightness(255);   // keep <120 for LiPo to prevent sag/brownout
   pixels.clear();
 }
 
@@ -862,10 +1033,16 @@ void loop() {
     s.ax    = d.x_accel;
     s.ay    = d.y_accel;
     s.az    = d.z_accel;
+    s.accel_mag = calcAccelMag(d.x_accel, d.y_accel, d.z_accel);  // Calculate once, reuse below
 
     ringHead = (ringHead + 1) % RING_CAP;
     if (ringHead == 0) ringFilled = true;
     // ---------- end ring buffer update ----------
+
+    // ---------- LED Control (real-time) ----------
+    #if ENABLE_LED_CONTROL
+      updateLEDs(s.accel_mag, d.x_accel, d.y_accel, d.z_accel);
+    #endif
 
     // --- throttle WS to ~15 Hz (lighter streaming) ---
     if (t_ms - lastSend >= 67) {  // 67 ms ≈ 15 fps
@@ -874,16 +1051,17 @@ void loop() {
       const uint32_t ts_us   = dev_now_us();
       const uint32_t thisSeq = ++seqNo;
 
-      // Slimmed JSON: only az + timing
-      char js[128];
+      // Reuse accel_mag from ring buffer (already calculated above)
+      // Slimmed JSON: accel_mag + timing
+      char js[160];
       snprintf(js, sizeof(js),
         "{\"type\":\"data\",\"seq\":%lu,\"t\":%lu,\"tr_us\":%lu,\"ts_us\":%lu,"
-        "\"az\":%.3f}",
+        "\"accel_mag\":%.3f}",
         (unsigned long)thisSeq,
         (unsigned long)t_ms,
         (unsigned long)tr_us,
         (unsigned long)ts_us,
-        d.z_accel
+        s.accel_mag  // Reuse the value we just calculated
       );
 
       ws.broadcastTXT(js);

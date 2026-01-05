@@ -13,7 +13,7 @@ import pandas as pd
 from pathlib import Path
 import re
 
-DATA_DIR = Path(__file__).parent.parent / "data" / "2026-01-03"
+DATA_DIR = Path(__file__).parent.parent / "data" / "2026-01-04"
 
 
 def extract_event_info(filepath):
