@@ -2,6 +2,11 @@
 """
 Rename CSV files to include their event classification and notes.
 
+Usage:
+  python rename_files_by_event.py                    # Auto-detect most recent date directory
+  python rename_files_by_event.py 2026-01-05        # Use specific date directory
+  python rename_files_by_event.py /path/to/data     # Use full path
+
 Example:
   download.txt -> download_other.txt
   download(20).txt -> download(20)_catch.txt
@@ -9,11 +14,14 @@ Example:
 """
 
 import os
+import sys
 import pandas as pd
 from pathlib import Path
 import re
+from datetime import datetime
 
-DATA_DIR = Path(__file__).parent.parent / "data" / "2026-01-04"
+# Base data directory
+BASE_DATA_DIR = Path(__file__).parent.parent / "data"
 
 
 def extract_event_info(filepath):
@@ -104,15 +112,98 @@ def rename_file(filepath, event_label, note):
         return False
 
 
+def find_most_recent_date_dir(base_dir):
+    """
+    Find the most recent date directory in the data folder.
+    
+    Returns:
+        Path to most recent date directory, or None if none found
+    """
+    if not base_dir.exists():
+        return None
+    
+    date_dirs = []
+    for item in base_dir.iterdir():
+        if item.is_dir():
+            # Try to parse as date (YYYY-MM-DD format)
+            try:
+                datetime.strptime(item.name, "%Y-%m-%d")
+                date_dirs.append((item, item.stat().st_mtime))  # (path, modification time)
+            except ValueError:
+                continue
+    
+    if not date_dirs:
+        return None
+    
+    # Sort by modification time (most recent first)
+    date_dirs.sort(key=lambda x: x[1], reverse=True)
+    return date_dirs[0][0]
+
+
+def get_data_directory():
+    """
+    Get the data directory from command line argument or auto-detect.
+    
+    Returns:
+        Path to data directory
+    """
+    if len(sys.argv) > 1:
+        # User provided a path
+        user_path = Path(sys.argv[1])
+        
+        # If it's a relative path, try relative to base data dir first
+        if not user_path.is_absolute():
+            # Check if it's a date directory name (YYYY-MM-DD)
+            try:
+                datetime.strptime(user_path.name, "%Y-%m-%d")
+                full_path = BASE_DATA_DIR / user_path
+                if full_path.exists():
+                    return full_path
+            except ValueError:
+                pass
+            
+            # Try as relative path from base data dir
+            full_path = BASE_DATA_DIR / user_path
+            if full_path.exists():
+                return full_path
+            
+            # Try as absolute path
+            if user_path.exists():
+                return user_path
+            
+            # If relative and doesn't exist, assume it's a date directory name
+            return BASE_DATA_DIR / user_path
+        else:
+            # Absolute path provided
+            return user_path
+    else:
+        # Auto-detect most recent date directory
+        recent_dir = find_most_recent_date_dir(BASE_DATA_DIR)
+        if recent_dir:
+            return recent_dir
+        else:
+            print("Error: No date directories found in data folder.")
+            print("Please specify a directory path as an argument.")
+            sys.exit(1)
+
+
 def main():
     """Main function to rename all files."""
     print("="*60)
     print("RENAMING FILES BY EVENT CLASSIFICATION")
     print("="*60)
+    
+    # Get data directory from argument or auto-detect
+    DATA_DIR = get_data_directory()
+    
     print(f"\nData directory: {DATA_DIR}")
     
     if not DATA_DIR.exists():
         print(f"Error: Data directory not found: {DATA_DIR}")
+        print("\nUsage:")
+        print("  python rename_files_by_event.py                    # Auto-detect most recent")
+        print("  python rename_files_by_event.py 2026-01-05        # Use specific date")
+        print("  python rename_files_by_event.py /path/to/data     # Use full path")
         return
     
     # Get all .txt files
