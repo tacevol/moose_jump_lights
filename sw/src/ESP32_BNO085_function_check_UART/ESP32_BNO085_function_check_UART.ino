@@ -193,7 +193,7 @@ void updateLEDsSmooth(float accel_mag) {
   
   // Convert HSV to RGB (ColorHSV: hue 0-65535, saturation 0-255, value 0-255)
   // Use offset colors like the old test code (offset by ~120 degrees)
-  const uint16_t HUE_OFFSET = 85 * 256;  // 85 in 0-255 space = 21760 in 0-65535 space (~120°)
+  const uint16_t HUE_OFFSET = 128 * 256;  // 85 in 0-255 space = 21760 in 0-65535 space (~120°)
   
   uint32_t color1 = pixels.ColorHSV(hue, SATURATION, BRIGHTNESS);
   uint32_t color2 = pixels.ColorHSV((hue + HUE_OFFSET) % 65535, SATURATION, BRIGHTNESS);
